@@ -110,7 +110,7 @@ public static class DatFile
     /// to reduce allocations. It also supports cancellation checks on each chunk.
     /// </summary>
     private static async IAsyncEnumerable<Dictionary<string, object>> GetRowsAsync(
-        StreamReader reader, 
+        StreamReader reader,
         DatFileOptions options,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -150,7 +150,7 @@ public static class DatFile
                 var count = headers.Count;
                 var dict = new Dictionary<string, object>(count, StringComparer.OrdinalIgnoreCase);
 
-                var hSpan = CollectionsMarshal.AsSpan(headers); 
+                var hSpan = CollectionsMarshal.AsSpan(headers);
                 var fSpan = CollectionsMarshal.AsSpan(fields);
 
                 for (int i = 0; i < count; i++)
@@ -404,17 +404,19 @@ public static class DatFile
     }
 
     /// <summary>
-    /// Reads the header and optionally counts data rows in a Concordance DAT file (by path).
-    /// When <paramref name="countRows"/> is true the file is scanned (without allocating per-row dictionaries)
-    /// to validate records and return the total data row count. Returns a tuple of header and row count.
+    /// Reads the header and counts data rows in a Concordance DAT file.
     /// </summary>
     /// <param name="path">File system path to a Concordance DAT file.</param>
-    /// <param name="countRows">If true, continue scanning the file after the header to count data rows.</param>
     /// <param name="cancellationToken">Cancellation token to cooperatively cancel the operation.</param>
+    /// <param name="progress">
+    /// Optional progress callback that receives (header fields, current row count) updates and returns the number of rows to process before next update.
+    /// Always called when header is available (row count = 0) and when counting completes.
+    /// </param>
     /// <returns>A tuple containing the header field names and the number of data rows in the file.</returns>
     public static async Task<(IReadOnlyList<string> Header, long RowCount)> GetCountAsync(
-        string path,
-        CancellationToken cancellationToken = default)
+        string path,        
+        CancellationToken cancellationToken = default,
+        Func<IReadOnlyList<string>, long, int> progress = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
 
@@ -422,21 +424,22 @@ public static class DatFile
         await using var fs = File.Open(path, opts.File);
         var encoding = DetectEncoding(fs);
         using var reader = new StreamReader(fs, encoding, detectEncodingFromByteOrderMarks: false, bufferSize: opts.ReaderBufferChars, leaveOpen: false);
-        return await GetCountAsync(reader, opts, cancellationToken).ConfigureAwait(false);
+        return await GetCountAsync(reader, opts, progress, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Reads the header and optionally counts data rows from a Concordance DAT stream.
-    /// When <paramref name="countRows"/> is true the stream is scanned (without allocating per-row dictionaries)
-    /// to validate records and return the total data row count. The stream must be readable and seekable
-    /// for encoding detection.
+    /// Reads the header and counts data rows from a Concordance DAT stream.
     /// </summary>
     /// <param name="stream">Readable, seekable stream positioned at the start of a Concordance DAT file.</param>
-    /// <param name="countRows">If true, continue scanning the file after the header to count data rows.</param>
+    /// <param name="progress">
+    /// Optional progress callback that receives (header fields, current row count) updates and returns the number of rows to process before next update.
+    /// Always called when header is available (row count = 0) and when counting completes.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token to cooperatively cancel the operation.</param>
     /// <returns>A tuple containing the header field names and the number of data rows in the stream.</returns>
     public static async Task<(IReadOnlyList<string> Header, long RowCount)> GetCountAsync(
-        Stream stream,        
+        Stream stream,
+        Func<IReadOnlyList<string>, long, int> progress = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
@@ -445,34 +448,36 @@ public static class DatFile
         var opts = DatFileOptions.Default.Clamp();
         var encoding = DetectEncoding(stream);
         using var reader = new StreamReader(stream, encoding, detectEncodingFromByteOrderMarks: false, bufferSize: opts.ReaderBufferChars, leaveOpen: false);
-        return await GetCountAsync(reader, opts, cancellationToken).ConfigureAwait(false);
+        return await GetCountAsync(reader, opts, progress, cancellationToken).ConfigureAwait(false);
     }
 
-    // Shared helper: parse header and optionally count rows using exactly the same state machine as GetRowsAsync
+    // Shared helper: parse header and count rows with optional progress updates
     private static async Task<(IReadOnlyList<string> Header, long RowCount)> GetCountAsync(
         StreamReader reader,
-        DatFileOptions options,       
+        DatFileOptions options,
+        Func<IReadOnlyList<string>, long, int> progress,
         CancellationToken cancellationToken)
     {
         var pool = ArrayPool<char>.Shared;
         var buffer = pool.Rent(options.ParseChunkChars);
-        var rowCount = 0L;
+        long rowCount =0;
+        long nextUpdate =1; // will be set when header is parsed
         try
         {
-            var sep = (char)0x14;   // Column separator
+            var sep = (char)0x14; // Column separator
             var quote = (char)0xFE; // Field quote
             var empty = options.EmptyFieldMode;
 
-            var inQuotes = false;   // True when inside a quoted field
-            var lastWasCR = false;  // True if last char was CR and we need to check for CRLF across chunks
+            var inQuotes = false; // True when inside a quoted field
+            var lastWasCR = false; // True if last char was CR and we need to check for CRLF across chunks
 
-            var field = new StringBuilder(8192);  // Accumulates the current field text
-            var fields = new List<string>(128);   // Collects fields for the current record
-            List<string> headers = null;          // Captured from the first record
+            var field = new StringBuilder(8192); // Accumulates the current field text
+            var fields = new List<string>(128); // Collects fields for the current record
+            IReadOnlyList<string> headers = null; // Captured from the first record (as IReadOnlyList)
 
             void EndField()
             {
-                // do not store field value after header is obtained
+                // store actual text only while building the header; after header is captured we store null placeholders
                 fields.Add(headers is null ? field.ToString() : null);
                 field.Clear();
             }
@@ -481,8 +486,20 @@ public static class DatFile
             {
                 if (headers is null)
                 {
+                    // first record is header - materialize to array and keep as IReadOnlyList
                     headers = [.. fields];
                     fields.Clear();
+
+                    // Always notify when header is available and determine first update interval
+                    if (progress is not null)
+                    {
+                        var interval = progress(headers,0);
+                        nextUpdate = Math.Max(1L, (long)interval);
+                    }
+                    else
+                    {
+                        nextUpdate = long.MaxValue;
+                    }
                 }
                 else
                 {
@@ -490,15 +507,22 @@ public static class DatFile
 
                     if (fields.Count != headers.Count)
                         throw new FormatException($"Invalid field count in row {rowCount}: got {fields.Count}, expected {headers.Count}. Each record must match the header column count and end with a line break.");
-                   
+
+                    // Notify progress if we've reached the next update point
+                    if (progress is not null && rowCount >= nextUpdate)
+                    {
+                        var interval = progress(headers, rowCount);
+                        nextUpdate = rowCount + Math.Max(1L, (long)interval);
+                    }
+
                     fields.Clear();
                 }
             }
 
             int read;
-            while ((read = await reader.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) > 0)
+            while ((read = await reader.ReadAsync(buffer,0, buffer.Length).ConfigureAwait(false)) >0)
             {
-                for (int i = 0; i < read; i++)
+                for (int i =0; i < read; i++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
@@ -510,7 +534,7 @@ public static class DatFile
                         if (ch == '\n' && !inQuotes)
                         {
                             EndField();
-                            EndRecord();                            
+                            EndRecord();
                             continue; // consume LF of CRLF
                         }
                         else
@@ -521,7 +545,7 @@ public static class DatFile
 
                     if (ch == quote)
                     {
-                        if (inQuotes && i + 1 < read && buffer[i + 1] == quote)
+                        if (inQuotes && i +1 < read && buffer[i +1] == quote)
                         {
                             field.Append(quote); // escaped quote
                             i++;
@@ -538,7 +562,7 @@ public static class DatFile
                     else if (!inQuotes && ch == '\n')
                     {
                         EndField();
-                        EndRecord();                        
+                        EndRecord();
                     }
                     else if (ch == '\r')
                     {
@@ -550,7 +574,7 @@ public static class DatFile
                     else
                     {
                         if (headers is null)
-                            field.Append(ch); // accumulate header fields
+                            field.Append(ch); // accumulate header fields only until header captured
                     }
                 }
             }
@@ -559,15 +583,22 @@ public static class DatFile
             if (lastWasCR && !inQuotes)
             {
                 EndField();
-                EndRecord();                
+                EndRecord();
             }
 
             // Flush any remaining data as the final record (handles missing trailing newline).
-            if (field.Length > 0 || fields.Count > 0)
+            if (field.Length >0 || fields.Count >0)
             {
                 EndField();
-                EndRecord();                
+                EndRecord();
             }
+
+            // Final progress notification (always call once on completion if progress provided)
+            if (progress is not null && headers is not null)
+                progress(headers, rowCount);
+
+            if (headers is null)
+                throw new FormatException("Empty or invalid Concordance DAT. Header row not found.");
 
             return (headers, rowCount);
         }
@@ -655,7 +686,7 @@ public static class DatFile
         if (bytes >= 2 && buf[0] == 0xC3 && buf[1] == 0xBE)
             return Utf8Strict();
 
-        throw new FormatException("Invalid Concordance DAT. After an optional BOM, the file must begin with the quote character U+00FE." 
+        throw new FormatException("Invalid Concordance DAT. After an optional BOM, the file must begin with the quote character U+00FE."
             + "The detected byte pattern does not match UTF-8 or UTF-16 (LE/BE) with U+00FE at the start. ");
     }
 }
